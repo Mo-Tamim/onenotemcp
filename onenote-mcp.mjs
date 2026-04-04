@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { InMemoryEventStore } from "@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js";
 import { Client } from '@microsoft/microsoft-graph-client';
 import { DeviceCodeCredential } from '@azure/identity';
 import { JSDOM } from 'jsdom';
@@ -9,17 +11,82 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fetch from 'node-fetch';
 import { z } from "zod";
+import express from 'express';
+import { randomUUID } from 'crypto';
 
 // --- Configuration ---
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const tokenFilePath = path.join(__dirname, '.access-token.txt');
+const tokenFilePath = process.env.TOKEN_FILE_PATH || path.join(__dirname, '.access-token.txt');
 const clientId = process.env.AZURE_CLIENT_ID || '14d82eec-204b-4c2f-b7e8-296a70dab67e'; // Default: Microsoft Graph Explorer App ID
 const scopes = ['Notes.Read', 'Notes.ReadWrite', 'Notes.Create', 'User.Read'];
+const PORT = parseInt(process.env.PORT || '3000', 10);
 
 // --- Global State ---
 let accessToken = null;
 let graphClient = null;
+const serverStartTime = Date.now();
+
+// --- Metrics & Logging ---
+const MAX_LOG_ENTRIES = 500;
+const metrics = {
+  tools: {},    // { toolName: { calls: 0, successes: 0, failures: 0, totalLatency: 0, lastCalledAt: null } }
+  logs: [],     // circular buffer of { timestamp, tool, params, status, duration, error? }
+  totalCalls: 0,
+  totalSuccesses: 0,
+  totalFailures: 0,
+};
+
+function recordToolCall(toolName, params, durationMs, success, error = null) {
+  if (!metrics.tools[toolName]) {
+    metrics.tools[toolName] = { calls: 0, successes: 0, failures: 0, totalLatency: 0, lastCalledAt: null };
+  }
+  const t = metrics.tools[toolName];
+  t.calls++;
+  t.totalLatency += durationMs;
+  t.lastCalledAt = new Date().toISOString();
+  if (success) { t.successes++; metrics.totalSuccesses++; }
+  else { t.failures++; metrics.totalFailures++; }
+  metrics.totalCalls++;
+
+  metrics.logs.push({
+    timestamp: new Date().toISOString(),
+    tool: toolName,
+    params: JSON.stringify(params).substring(0, 200),
+    status: success ? 'success' : 'error',
+    duration: Math.round(durationMs),
+    error: error ? String(error).substring(0, 200) : null,
+  });
+  if (metrics.logs.length > MAX_LOG_ENTRIES) {
+    metrics.logs.shift();
+  }
+}
+
+function getStats() {
+  const toolStats = Object.entries(metrics.tools).map(([name, t]) => ({
+    name,
+    calls: t.calls,
+    successes: t.successes,
+    failures: t.failures,
+    avgLatency: t.calls > 0 ? Math.round(t.totalLatency / t.calls) : 0,
+    lastCalledAt: t.lastCalledAt,
+  }));
+  return {
+    uptime: Math.round((Date.now() - serverStartTime) / 1000),
+    totalCalls: metrics.totalCalls,
+    totalSuccesses: metrics.totalSuccesses,
+    totalFailures: metrics.totalFailures,
+    tools: toolStats,
+  };
+}
+
+function getLogs(limit = 50, offset = 0) {
+  const reversed = [...metrics.logs].reverse(); // newest first
+  return reversed.slice(offset, offset + limit);
+}
+
+// --- Pending auth state (for dashboard-initiated auth) ---
+let pendingAuth = null; // { userCode, verificationUri, promise, resolved }
 
 // --- MCP Server Initialization ---
 const server = new McpServer({
@@ -27,6 +94,26 @@ const server = new McpServer({
   version: '1.0.0', 
   description: 'OneNote MCP Server - Read, Write, and Edit OneNote content.'
 });
+
+// --- Wrap server.tool() to auto-collect metrics ---
+const _originalTool = server.tool.bind(server);
+server.tool = function(name, schema, handler) {
+  const wrappedHandler = async (params, extra) => {
+    const start = Date.now();
+    try {
+      const result = await handler(params, extra);
+      const duration = Date.now() - start;
+      const success = !result.isError;
+      recordToolCall(name, params, duration, success, result.isError ? 'Tool returned error' : null);
+      return result;
+    } catch (err) {
+      const duration = Date.now() - start;
+      recordToolCall(name, params, duration, false, err.message);
+      throw err;
+    }
+  };
+  return _originalTool(name, schema, wrappedHandler);
+};
 
 // ============================================================================
 // AUTHENTICATION & MICROSOFT GRAPH CLIENT MANAGEMENT
@@ -753,45 +840,359 @@ server.tool(
 
 
 // ============================================================================
-// SERVER STARTUP
+// SERVER STARTUP — Express + Streamable HTTP Transport
 // ============================================================================
 
-/**
- * Main function to initialize and start the MCP server.
- */
-async function main() {
-  loadExistingToken(); // Attempt to load token at startup
-  if (accessToken) {
-    initializeGraphClient(); // Initialize client if token was loaded
-  }
-
+function getAuthStatus() {
+  let tokenExpiry = null;
+  let userInfo = null;
   try {
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    
-    console.error('🚀✨ OneNote Ultimate MCP Server is now LIVE! ✨🚀');
-    console.error(`   Client ID: ${clientId.substring(0, 8)}... (Using ${process.env.AZURE_CLIENT_ID ? 'environment variable' : 'default'})`);
-    console.error('   Ready to manage your OneNote like never before!');
-    console.error('--- Available Tool Categories ---');
-    console.error('   🔐 Auth: authenticate, saveAccessToken');
-    console.error('   📚 Read: listNotebooks, searchPages, getPageContent, getPageByTitle');
-    console.error('   ✏️ Edit: updatePageContent, appendToPage, updatePageTitle, replaceTextInPage, addNoteToPage, addTableToPage');
-    console.error('   ➕ Create: createPage');
-    console.error('---------------------------------');
-    
-    process.on('SIGINT', () => {
-      console.error('\n🔌 OneNote MCP Server shutting down gracefully...');
-      process.exit(0);
-    });
-    process.on('SIGTERM', () => {
-      console.error('\n🔌 OneNote MCP Server terminated...');
-      process.exit(0);
-    });
+    if (fs.existsSync(tokenFilePath)) {
+      const data = JSON.parse(fs.readFileSync(tokenFilePath, 'utf8'));
+      tokenExpiry = data.expiresOn || null;
+    }
+  } catch { /* ignore */ }
+  return {
+    authenticated: !!accessToken,
+    tokenExpiry,
+    clientId: clientId.substring(0, 8) + '...',
+    pendingAuth: pendingAuth ? { userCode: pendingAuth.userCode, verificationUri: pendingAuth.verificationUri } : null,
+  };
+}
 
-  } catch (error) {
-    console.error(`💀 Critical error starting server: ${error.message}`, error.stack);
-    process.exit(1);
+function getDashboardHtml() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OneNote MCP Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; min-height: 100vh; }
+  .header { background: #161b22; border-bottom: 1px solid #30363d; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+  .header h1 { font-size: 20px; color: #58a6ff; }
+  .header .status { display: flex; align-items: center; gap: 8px; }
+  .badge { padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+  .badge.ok { background: #238636; color: #fff; }
+  .badge.error { background: #da3633; color: #fff; }
+  .badge.pending { background: #d29922; color: #fff; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+  .card h3 { font-size: 12px; color: #8b949e; text-transform: uppercase; margin-bottom: 8px; }
+  .card .value { font-size: 28px; font-weight: 700; color: #f0f6fc; }
+  .card .sub { font-size: 12px; color: #8b949e; margin-top: 4px; }
+  .section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 24px; overflow: hidden; }
+  .section-header { padding: 12px 16px; border-bottom: 1px solid #30363d; font-weight: 600; font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 10px 16px; background: #0d1117; color: #8b949e; font-weight: 600; border-bottom: 1px solid #30363d; }
+  td { padding: 10px 16px; border-bottom: 1px solid #21262d; }
+  tr:hover td { background: #1c2128; }
+  .auth-panel { padding: 16px; }
+  .auth-panel button { background: #238636; color: #fff; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; }
+  .auth-panel button:hover { background: #2ea043; }
+  .auth-panel button:disabled { background: #30363d; cursor: not-allowed; }
+  .device-code { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin-top: 12px; text-align: center; }
+  .device-code .code { font-size: 32px; font-weight: 700; letter-spacing: 4px; color: #58a6ff; margin: 8px 0; }
+  .device-code a { color: #58a6ff; }
+  .success-text { color: #3fb950; }
+  .error-text { color: #f85149; }
+  .latency { color: #8b949e; }
+  .log-status { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .log-status.success { background: #238636; color: #fff; }
+  .log-status.error { background: #da3633; color: #fff; }
+  .auto-refresh { font-size: 12px; color: #484f58; }
+  .params-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #8b949e; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>OneNote MCP Server</h1>
+  <div class="status">
+    <span class="auto-refresh">Auto-refresh: 5s</span>
+    <span id="authBadge" class="badge error">Not Authenticated</span>
+    <span id="uptimeBadge" class="badge ok">--</span>
+  </div>
+</div>
+<div class="container">
+  <div class="grid">
+    <div class="card"><h3>Uptime</h3><div class="value" id="uptime">--</div></div>
+    <div class="card"><h3>Total Calls</h3><div class="value" id="totalCalls">0</div></div>
+    <div class="card"><h3>Success Rate</h3><div class="value" id="successRate">--</div><div class="sub" id="successSub"></div></div>
+    <div class="card"><h3>Auth Status</h3><div class="value" id="authStatus">--</div><div class="sub" id="tokenExpiry"></div></div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">Authentication</div>
+    <div class="auth-panel" id="authPanel">
+      <button id="authBtn" onclick="startAuth()">Authenticate with Microsoft</button>
+      <div id="authInfo"></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">Tool Metrics</div>
+    <table>
+      <thead><tr><th>Tool</th><th>Calls</th><th>Success</th><th>Failures</th><th>Avg Latency</th><th>Last Called</th></tr></thead>
+      <tbody id="toolsTable"><tr><td colspan="6" style="text-align:center;color:#484f58;">No tool calls yet</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <div class="section-header">Request Log</div>
+    <table>
+      <thead><tr><th>Timestamp</th><th>Tool</th><th>Parameters</th><th>Status</th><th>Duration</th></tr></thead>
+      <tbody id="logsTable"><tr><td colspan="5" style="text-align:center;color:#484f58;">No requests yet</td></tr></tbody>
+    </table>
+  </div>
+</div>
+<script>
+function fmt(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return h>0?h+'h '+m+'m':m>0?m+'m '+sec+'s':sec+'s';}
+function timeAgo(iso){if(!iso)return'--';const d=Date.now()-new Date(iso).getTime();if(d<60000)return Math.round(d/1000)+'s ago';if(d<3600000)return Math.round(d/60000)+'m ago';return Math.round(d/3600000)+'h ago';}
+
+async function refresh(){
+  try{
+    const [statsRes,logsRes,authRes]=await Promise.all([fetch('/api/stats'),fetch('/api/logs?limit=50'),fetch('/api/auth/status')]);
+    const stats=await statsRes.json(),logs=await logsRes.json(),auth=await authRes.json();
+
+    document.getElementById('uptime').textContent=fmt(stats.uptime);
+    document.getElementById('uptimeBadge').textContent=fmt(stats.uptime);
+    document.getElementById('totalCalls').textContent=stats.totalCalls;
+    const rate=stats.totalCalls>0?Math.round(stats.totalSuccesses/stats.totalCalls*100):100;
+    document.getElementById('successRate').textContent=rate+'%';
+    document.getElementById('successSub').textContent=stats.totalSuccesses+' ok / '+stats.totalFailures+' err';
+
+    const ab=document.getElementById('authBadge');
+    const as=document.getElementById('authStatus');
+    const te=document.getElementById('tokenExpiry');
+    if(auth.authenticated){ab.className='badge ok';ab.textContent='Authenticated';as.innerHTML='<span class="success-text">Active</span>';
+      te.textContent=auth.tokenExpiry?'Expires: '+new Date(auth.tokenExpiry).toLocaleString():'';
+      document.getElementById('authBtn').disabled=true;document.getElementById('authBtn').textContent='Authenticated';
+      document.getElementById('authInfo').innerHTML='';
+    } else if(auth.pendingAuth){ab.className='badge pending';ab.textContent='Pending Auth';as.innerHTML='<span style="color:#d29922">Pending</span>';te.textContent='';
+    } else {ab.className='badge error';ab.textContent='Not Authenticated';as.innerHTML='<span class="error-text">None</span>';te.textContent='';
+      document.getElementById('authBtn').disabled=false;document.getElementById('authBtn').textContent='Authenticate with Microsoft';
+    }
+
+    const tt=document.getElementById('toolsTable');
+    if(stats.tools.length>0){tt.innerHTML=stats.tools.sort((a,b)=>b.calls-a.calls).map(t=>'<tr><td><strong>'+t.name+'</strong></td><td>'+t.calls+'</td><td class="success-text">'+t.successes+'</td><td class="error-text">'+t.failures+'</td><td class="latency">'+t.avgLatency+'ms</td><td class="latency">'+timeAgo(t.lastCalledAt)+'</td></tr>').join('');}
+
+    const lt=document.getElementById('logsTable');
+    if(logs.length>0){lt.innerHTML=logs.map(l=>'<tr><td class="latency">'+new Date(l.timestamp).toLocaleTimeString()+'</td><td><strong>'+l.tool+'</strong></td><td class="params-cell" title="'+l.params.replace(/"/g,'&quot;')+'">'+l.params+'</td><td><span class="log-status '+l.status+'">'+l.status+'</span></td><td class="latency">'+l.duration+'ms</td></tr>').join('');}
+  }catch(e){console.error('Dashboard refresh error:',e);}
+}
+
+async function startAuth(){
+  document.getElementById('authBtn').disabled=true;
+  document.getElementById('authBtn').textContent='Starting...';
+  try{
+    const res=await fetch('/api/auth/start',{method:'POST'});
+    const data=await res.json();
+    if(data.userCode){
+      document.getElementById('authInfo').innerHTML='<div class="device-code"><p>Open the link below and enter the code:</p><div class="code">'+data.userCode+'</div><p><a href="'+data.verificationUri+'" target="_blank">'+data.verificationUri+'</a></p><p style="margin-top:8px;color:#8b949e;">Waiting for authentication...</p></div>';
+    } else {
+      document.getElementById('authInfo').innerHTML='<p class="error-text" style="margin-top:8px;">'+( data.error||'Failed to start auth')+'</p>';
+      document.getElementById('authBtn').disabled=false;document.getElementById('authBtn').textContent='Authenticate with Microsoft';
+    }
+  }catch(e){
+    document.getElementById('authInfo').innerHTML='<p class="error-text" style="margin-top:8px;">Error: '+e.message+'</p>';
+    document.getElementById('authBtn').disabled=false;document.getElementById('authBtn').textContent='Authenticate with Microsoft';
   }
+}
+
+refresh();
+setInterval(refresh,5000);
+</script>
+</body>
+</html>`;
+}
+
+async function main() {
+  loadExistingToken();
+  if (accessToken) {
+    initializeGraphClient();
+  }
+
+  const app = express();
+  app.use(express.json());
+
+  // --- MCP Transport (Streamable HTTP) ---
+  const transports = {};
+
+  app.post('/mcp', async (req, res) => {
+    try {
+      const sessionId = req.headers['mcp-session-id'];
+      let transport;
+
+      if (sessionId && transports[sessionId]) {
+        transport = transports[sessionId];
+      } else if (!sessionId && isInitializeRequest(req.body)) {
+        const eventStore = new InMemoryEventStore();
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          eventStore,
+          onsessioninitialized: (sid) => {
+            transports[sid] = transport;
+            console.error(`MCP session initialized: ${sid}`);
+          },
+        });
+        transport.onclose = () => {
+          const sid = transport.sessionId;
+          if (sid && transports[sid]) {
+            delete transports[sid];
+            console.error(`MCP session closed: ${sid}`);
+          }
+        };
+        await server.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+        return;
+      } else {
+        res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: No valid session ID' }, id: null });
+        return;
+      }
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error('MCP POST error:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null });
+      }
+    }
+  });
+
+  app.get('/mcp', async (req, res) => {
+    const sessionId = req.headers['mcp-session-id'];
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
+      return;
+    }
+    await transports[sessionId].handleRequest(req, res);
+  });
+
+  app.delete('/mcp', async (req, res) => {
+    const sessionId = req.headers['mcp-session-id'];
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
+      return;
+    }
+    try {
+      await transports[sessionId].handleRequest(req, res);
+    } catch (error) {
+      console.error('MCP DELETE error:', error);
+      if (!res.headersSent) res.status(500).send('Error processing session termination');
+    }
+  });
+
+  // --- Dashboard & API Endpoints ---
+
+  app.get('/', (_req, res) => {
+    res.type('html').send(getDashboardHtml());
+  });
+
+  app.get('/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      uptime: Math.round((Date.now() - serverStartTime) / 1000),
+      authenticated: !!accessToken,
+      version: '1.0.0',
+      activeSessions: Object.keys(transports).length,
+    });
+  });
+
+  app.get('/api/stats', (_req, res) => {
+    res.json(getStats());
+  });
+
+  app.get('/api/logs', (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+    const offset = parseInt(req.query.offset) || 0;
+    res.json(getLogs(limit, offset));
+  });
+
+  app.get('/api/auth/status', (_req, res) => {
+    res.json(getAuthStatus());
+  });
+
+  app.post('/api/auth/start', async (_req, res) => {
+    if (accessToken) {
+      return res.json({ error: 'Already authenticated' });
+    }
+    if (pendingAuth && !pendingAuth.resolved) {
+      return res.json({ userCode: pendingAuth.userCode, verificationUri: pendingAuth.verificationUri });
+    }
+    try {
+      pendingAuth = { userCode: null, verificationUri: null, resolved: false };
+      const credential = new DeviceCodeCredential({
+        clientId: clientId,
+        userPromptCallback: (info) => {
+          pendingAuth.userCode = info.userCode;
+          pendingAuth.verificationUri = 'https://microsoft.com/devicelogin';
+          console.error(`Dashboard auth initiated — Code: ${info.userCode}`);
+        },
+      });
+
+      const tokenPromise = credential.getToken(scopes);
+      // Wait briefly for the callback to fire
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      if (!pendingAuth.userCode) {
+        pendingAuth = null;
+        return res.json({ error: 'Could not retrieve device code. Try again.' });
+      }
+
+      res.json({ userCode: pendingAuth.userCode, verificationUri: pendingAuth.verificationUri });
+
+      // Complete auth in background
+      tokenPromise.then(tokenResponse => {
+        accessToken = tokenResponse.token;
+        const tokenData = {
+          token: accessToken,
+          clientId: clientId,
+          scopes: scopes,
+          createdAt: new Date().toISOString(),
+          expiresOn: tokenResponse.expiresOnTimestamp ? new Date(tokenResponse.expiresOnTimestamp).toISOString() : null,
+        };
+        const dir = path.dirname(tokenFilePath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(tokenFilePath, JSON.stringify(tokenData, null, 2));
+        console.error('Token saved via dashboard auth!');
+        initializeGraphClient();
+        pendingAuth.resolved = true;
+      }).catch(error => {
+        console.error(`Dashboard auth failed: ${error.message}`);
+        pendingAuth = null;
+      });
+    } catch (error) {
+      pendingAuth = null;
+      res.json({ error: error.message });
+    }
+  });
+
+  // --- Start server ---
+  app.listen(PORT, '0.0.0.0', () => {
+    console.error(`🚀 OneNote MCP Server listening on http://0.0.0.0:${PORT}`);
+    console.error(`   Dashboard: http://localhost:${PORT}`);
+    console.error(`   MCP endpoint: http://localhost:${PORT}/mcp`);
+    console.error(`   Health: http://localhost:${PORT}/health`);
+    console.error(`   Client ID: ${clientId.substring(0, 8)}... (${process.env.AZURE_CLIENT_ID ? 'env' : 'default'})`);
+    console.error(`   Token file: ${tokenFilePath}`);
+    console.error(`   Authenticated: ${!!accessToken}`);
+  });
+
+  process.on('SIGINT', async () => {
+    console.error('\\n🔌 Shutting down...');
+    for (const sid in transports) {
+      try { await transports[sid].close(); } catch { /* ignore */ }
+    }
+    process.exit(0);
+  });
+  process.on('SIGTERM', async () => {
+    console.error('\\n🔌 Terminated...');
+    for (const sid in transports) {
+      try { await transports[sid].close(); } catch { /* ignore */ }
+    }
+    process.exit(0);
+  });
 }
 
 main();
