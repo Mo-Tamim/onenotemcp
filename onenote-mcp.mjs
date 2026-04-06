@@ -88,32 +88,41 @@ function getLogs(limit = 50, offset = 0) {
 // --- Pending auth state (for dashboard-initiated auth) ---
 let pendingAuth = null; // { userCode, verificationUri, promise, resolved }
 
-// --- MCP Server Initialization ---
-const server = new McpServer({
-  name: 'onenote',
-  version: '1.0.0', 
-  description: 'OneNote MCP Server - Read, Write, and Edit OneNote content.'
-});
+// --- MCP Server Factory ---
+// Each MCP session needs its own McpServer instance (SDK limitation: one transport per server).
+// All tool definitions go inside this factory so every session gets the full tool set.
+function createMcpServer() {
+  const server = new McpServer({
+    name: 'onenote',
+    version: '1.0.0', 
+    description: 'OneNote MCP Server - Read, Write, and Edit OneNote content.'
+  });
 
-// --- Wrap server.tool() to auto-collect metrics ---
-const _originalTool = server.tool.bind(server);
-server.tool = function(name, schema, handler) {
-  const wrappedHandler = async (params, extra) => {
-    const start = Date.now();
-    try {
-      const result = await handler(params, extra);
-      const duration = Date.now() - start;
-      const success = !result.isError;
-      recordToolCall(name, params, duration, success, result.isError ? 'Tool returned error' : null);
-      return result;
-    } catch (err) {
-      const duration = Date.now() - start;
-      recordToolCall(name, params, duration, false, err.message);
-      throw err;
-    }
+  // --- Wrap server.tool() to auto-collect metrics ---
+  const _originalTool = server.tool.bind(server);
+  server.tool = function(name, schema, handler) {
+    const wrappedHandler = async (params, extra) => {
+      const start = Date.now();
+      try {
+        const result = await handler(params, extra);
+        const duration = Date.now() - start;
+        const success = !result.isError;
+        recordToolCall(name, params, duration, success, result.isError ? 'Tool returned error' : null);
+        return result;
+      } catch (err) {
+        const duration = Date.now() - start;
+        recordToolCall(name, params, duration, false, err.message);
+        throw err;
+      }
+    };
+    return _originalTool(name, schema, wrappedHandler);
   };
-  return _originalTool(name, schema, wrappedHandler);
-};
+
+  // --- Register all tools (defined below at module scope) ---
+  registerTools(server);
+
+  return server;
+} // end createMcpServer()
 
 // ============================================================================
 // AUTHENTICATION & MICROSOFT GRAPH CLIENT MANAGEMENT
@@ -330,6 +339,8 @@ function formatPageInfo(page, index = null) {
 // ============================================================================
 // MCP TOOL DEFINITIONS
 // ============================================================================
+
+function registerTools(server) {
 
 // --- Authentication Tools ---
 
@@ -839,6 +850,8 @@ server.tool(
   }
 );
 
+} // end registerTools()
+
 
 
 // ============================================================================
@@ -1020,7 +1033,7 @@ async function main() {
   app.use(express.json());
 
   // --- MCP Transport (Streamable HTTP) ---
-  const transports = {};
+  const transports = {};  // sessionId -> { transport, server }
 
   app.post('/mcp', async (req, res) => {
     try {
@@ -1028,14 +1041,16 @@ async function main() {
       let transport;
 
       if (sessionId && transports[sessionId]) {
-        transport = transports[sessionId];
+        transport = transports[sessionId].transport;
       } else if (!sessionId && isInitializeRequest(req.body)) {
+        // Each session gets its own McpServer instance
+        const mcpServer = createMcpServer();
         const eventStore = new InMemoryEventStore();
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           eventStore,
           onsessioninitialized: (sid) => {
-            transports[sid] = transport;
+            transports[sid] = { transport, server: mcpServer };
             console.error(`MCP session initialized: ${sid}`);
           },
         });
@@ -1046,7 +1061,7 @@ async function main() {
             console.error(`MCP session closed: ${sid}`);
           }
         };
-        await server.connect(transport);
+        await mcpServer.connect(transport);
         await transport.handleRequest(req, res, req.body);
         return;
       } else {
@@ -1068,7 +1083,7 @@ async function main() {
       res.status(400).send('Invalid or missing session ID');
       return;
     }
-    await transports[sessionId].handleRequest(req, res);
+    await transports[sessionId].transport.handleRequest(req, res);
   });
 
   app.delete('/mcp', async (req, res) => {
@@ -1078,7 +1093,7 @@ async function main() {
       return;
     }
     try {
-      await transports[sessionId].handleRequest(req, res);
+      await transports[sessionId].transport.handleRequest(req, res);
     } catch (error) {
       console.error('MCP DELETE error:', error);
       if (!res.headersSent) res.status(500).send('Error processing session termination');
@@ -1183,16 +1198,16 @@ async function main() {
   });
 
   process.on('SIGINT', async () => {
-    console.error('\\n🔌 Shutting down...');
+    console.error('\n🔌 Shutting down...');
     for (const sid in transports) {
-      try { await transports[sid].close(); } catch { /* ignore */ }
+      try { await transports[sid].transport.close(); } catch { /* ignore */ }
     }
     process.exit(0);
   });
   process.on('SIGTERM', async () => {
-    console.error('\\n🔌 Terminated...');
+    console.error('\n🔌 Terminated...');
     for (const sid in transports) {
-      try { await transports[sid].close(); } catch { /* ignore */ }
+      try { await transports[sid].transport.close(); } catch { /* ignore */ }
     }
     process.exit(0);
   });

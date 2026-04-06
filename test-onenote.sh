@@ -22,7 +22,7 @@ mcp_request() {
   local params="$2"
   REQUEST_ID=$((REQUEST_ID + 1))
 
-  local headers=(-H "Content-Type: application/json" -H "Accept: text/event-stream")
+  local headers=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
   if [ -n "$SESSION_ID" ]; then
     headers+=(-H "Mcp-Session-Id: $SESSION_ID")
   fi
@@ -46,6 +46,9 @@ init_session() {
   local init
   init=$(mcp_request "initialize" '{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test-onenote-script","version":"1.0.0"}}')
 
+  # Extract session ID from headers (subshell in mcp_request can't set outer vars)
+  SESSION_ID=$(grep -i 'mcp-session-id' /tmp/mcp_headers 2>/dev/null | tr -d '\r' | awk '{print $2}')
+
   if [ -z "$SESSION_ID" ]; then
     echo "ERROR: Failed to connect. Is the server running?" >&2
     echo "  Try: docker compose ps" >&2
@@ -55,6 +58,7 @@ init_session() {
   # Send the required initialized notification
   curl -s -X POST "$MCP_URL" \
     -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
     -H "Mcp-Session-Id: $SESSION_ID" \
     -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' > /dev/null
 
