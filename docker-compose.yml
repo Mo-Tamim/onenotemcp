@@ -9,8 +9,8 @@ services:
     environment:
       - PORT=3000
       - TOKEN_FILE_PATH=/data/.access-token.txt
-      # Set your own Azure App Registration client ID:
-      - AZURE_CLIENT_ID=lkjghjklhgkjhgljghljghljgh
+      # Set your own Azure App Registration client ID in the .env file:
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
     restart: unless-stopped
 
 volumes:
