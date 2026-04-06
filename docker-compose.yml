@@ -1,0 +1,17 @@
+services:
+  onenote-mcp:
+    build: .
+    container_name: onenote-mcp
+    ports:
+      - "3300:3000"
+    volumes:
+      - onenote-data:/data
+    environment:
+      - PORT=3000
+      - TOKEN_FILE_PATH=/data/.access-token.txt
+      # Set your own Azure App Registration client ID:
+      - AZURE_CLIENT_ID=
+    restart: unless-stopped
+
+volumes:
+  onenote-data:

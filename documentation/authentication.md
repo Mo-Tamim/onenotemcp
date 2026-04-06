@@ -12,18 +12,18 @@ The server uses the **OAuth 2.0 Device Code Flow**, which is designed for device
 sequenceDiagram
     participant LLM as AI Client (Claude)
     participant Server as MCP Server
-    participant Azure as Azure AD
+    participant Azure as Microsoft Entra ID
     participant Browser as User's Browser
     participant Graph as Microsoft Graph
 
     LLM->>Server: Call "authenticate" tool
-    Server->>Azure: Request device code
+    Server->>Azure: Request device code (MSAL)
     Azure-->>Server: Device code + user code + URL
     Server-->>LLM: "Go to https://microsoft.com/devicelogin<br/>Enter code: XXXXXXXXX"
     LLM-->>Browser: User opens URL manually
     Browser->>Azure: User enters code & signs in
-    Azure->>Azure: User grants permissions
-    Azure-->>Server: Access token (background callback)
+    Azure->>Azure: User grants consent
+    Azure-->>Server: Access token via MSAL callback
     Server->>Server: Save token to .access-token.txt
     Server->>Server: initializeGraphClient()
     Note over LLM,Server: User calls "saveAccessToken" to verify
@@ -35,7 +35,7 @@ sequenceDiagram
 
 ## Step-by-Step
 
-1. **Invoke `authenticate`** — Your AI assistant calls the tool. The server creates a `DeviceCodeCredential` and requests a device code from Azure AD.
+1. **Invoke `authenticate`** — Your AI assistant calls the tool. The server creates a `DeviceCodeCredential` and requests a device code from Microsoft Entra ID.
 
 2. **Device code displayed** — The server returns a message containing:
    - A URL: `https://microsoft.com/devicelogin`
@@ -94,7 +94,9 @@ try {
 }
 ```
 
-## Azure App Registration
+## Microsoft Entra ID App Registration
+
+> **Note:** Azure Active Directory (Azure AD) has been renamed to **Microsoft Entra ID**. The server uses the Microsoft Authentication Library (MSAL) via `@azure/identity`, which is the current recommended library. All instructions below use the Entra admin center.
 
 ### Default Client ID
 
@@ -104,31 +106,38 @@ If `AZURE_CLIENT_ID` is not set, the server falls back to Microsoft Graph Explor
 14d82eec-204b-4c2f-b7e8-296a70dab67e
 ```
 
-This is fine for quick testing but **not recommended for production** — Microsoft may rate-limit or revoke public app access.
+This is fine for quick testing but **not recommended for regular use** — Microsoft may rate-limit or revoke public app access.
 
 ### Creating Your Own App Registration
 
-1. Go to [Azure Portal → App Registrations](https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationsListBlade).
-2. Click **New registration**.
-3. Set a name (e.g., "OneNote MCP Server").
-4. Under **Supported account types**, choose "Accounts in any organizational directory and personal Microsoft accounts".
-5. No redirect URI is needed for device code flow.
-6. After creation, copy the **Application (client) ID**.
-7. Go to **API permissions** → **Add a permission** → **Microsoft Graph** → **Delegated permissions**:
+1. Go to [Microsoft Entra Admin Center → App Registrations](https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade).
+2. Click **+ New registration**.
+3. Set a name (e.g., `OneNote MCP Server`).
+4. Under **Supported account types**, select: **"Accounts in any organizational directory (Any Microsoft Entra ID tenant - Multitenant) and personal Microsoft accounts (e.g. Skype, Xbox)"**.
+5. Leave **Redirect URI** blank — not needed for device code flow.
+6. Click **Register**.
+7. On the app's **Overview** page, copy the **Application (client) ID**.
+8. In the left sidebar, click **Authentication**:
+   - Scroll down to **Advanced settings**.
+   - Set **"Allow public client flows"** to **Yes**.
+   - Click **Save**.
+9. In the left sidebar, click **API permissions** → **+ Add a permission** → **Microsoft Graph** → **Delegated permissions**:
    - `Notes.Read`
    - `Notes.ReadWrite`
    - `Notes.Create`
-   - `User.Read`
-8. Set the environment variable:
-   ```bash
-   export AZURE_CLIENT_ID="your-application-client-id"
-   ```
+   - `User.Read` (usually added by default)
+   - Click **Add permissions**.
+10. Set the Client ID in your `docker-compose.yml`:
+    ```yaml
+    environment:
+      - AZURE_CLIENT_ID=your-application-client-id
+    ```
 
 ### Required Permissions
 
 ```mermaid
 graph TD
-    A["Azure AD App"] --> B["Notes.Read<br/>Read OneNote notebooks"]
+    A["Microsoft Entra App"] --> B["Notes.Read<br/>Read OneNote notebooks"]
     A --> C["Notes.ReadWrite<br/>Read & write notebooks"]
     A --> D["Notes.Create<br/>Create new notebooks/pages"]
     A --> E["User.Read<br/>Read user profile (verify auth)"]
@@ -138,9 +147,10 @@ graph TD
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| "No access token available" | Token not yet obtained or file missing | Run the `authenticate` tool |
-| Device code expired | Took too long to complete browser flow | Re-run `authenticate` — codes expire in ~15 minutes |
-| 401 Unauthorized from Graph API | Token expired | Re-run `authenticate` |
-| "AADSTS7000218: request body must contain client_assertion" | Wrong app type in Azure | Ensure public client flows are enabled in the app registration |
-| Token file exists but tools fail | Token expired but file persists | Delete `.access-token.txt` and re-authenticate |
-| Rate limiting / throttling | Using the default public Client ID | Create your own Azure App Registration |
+| "No access token available" | Token not yet obtained or file missing | Run the `authenticate` tool or click Authenticate on the dashboard |
+| Device code expired | Took too long to complete browser flow | Re-run — codes expire in ~15 minutes |
+| 401 Unauthorized from Graph API | Token expired (~1 hour lifetime) | Re-authenticate via dashboard or `POST /api/auth/start` |
+| `AADSTS7000218: request body must contain client_assertion` | Public client flows not enabled | Entra → your app → Authentication → "Allow public client flows" → **Yes** |
+| `AADSTS65001` or consent error | Permissions not granted | Entra → your app → API permissions → verify all 4 are listed |
+| Token file exists but tools fail | Token expired but file persists | Re-authenticate (old token is overwritten) |
+| Rate limiting / 429 errors | Using the default public Client ID | Create your own app registration (see above) |

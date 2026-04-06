@@ -1,0 +1,9 @@
+node_modules
+.access-token.txt
+.git
+.gitignore
+documentation
+ReadMe.md
+LICENSE
+*.md
+!package.json
