@@ -10,7 +10,7 @@ services:
       - PORT=3000
       - TOKEN_FILE_PATH=/data/.access-token.txt
       # Set your own Azure App Registration client ID:
-      - AZURE_CLIENT_ID=9d46a90b-11cd-4067-9332-f524a74fd36c
+      - AZURE_CLIENT_ID=
     restart: unless-stopped
 
 volumes:
