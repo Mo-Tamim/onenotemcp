@@ -3,7 +3,7 @@ services:
     build: .
     container_name: onenote-mcp
     ports:
-      - "3000:3000"
+      - "3300:3000"
     volumes:
       - onenote-data:/data
     environment:
