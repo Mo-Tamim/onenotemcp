@@ -450,7 +450,13 @@ server.tool(
       await ensureGraphClient();
       const response = await graphClient.api('/me/onenote/notebooks').get();
       if (response.value && response.value.length > 0) {
-        const notebookList = response.value.map((nb, i) => formatPageInfo(nb, i)).join('\n\n');
+        const notebookList = response.value.map((nb, i) => {
+          const prefix = `${i + 1}. `;
+          return `${prefix}**${nb.displayName}**
+   ID: ${nb.id}
+   Created: ${new Date(nb.createdDateTime).toLocaleDateString()}
+   Modified: ${new Date(nb.lastModifiedDateTime).toLocaleDateString()}`;
+        }).join('\n\n');
         return { content: [{ type: 'text', text: `📚 **Your OneNote Notebooks** (${response.value.length} found):\n\n${notebookList}` }] };
       } else {
         return { content: [{ type: 'text', text: '📚 No OneNote notebooks found.' }] };
