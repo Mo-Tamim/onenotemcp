@@ -344,6 +344,7 @@ server.tool(
       let deviceCodeInfo = null;
       const credential = new DeviceCodeCredential({
         clientId: clientId,
+        tenantId: 'consumers',
         userPromptCallback: (info) => {
           deviceCodeInfo = info;
           console.error(`\n=== AUTHENTICATION REQUIRED ===\n${info.message}\n================================\n`);
@@ -351,13 +352,14 @@ server.tool(
       });
 
       const authPromise = credential.getToken(scopes);
-      await new Promise(resolve => setTimeout(resolve, 2000)); // Allow time for userPromptCallback
+      await new Promise(resolve => setTimeout(resolve, 5000)); // Allow time for userPromptCallback
 
       if (deviceCodeInfo) {
+        const verifyUrl = deviceCodeInfo.verificationUri || 'https://microsoft.com/devicelogin';
         const authMessage = `🔐 **AUTHENTICATION REQUIRED**
 
 Please complete the following steps:
-1. **Open this URL in your browser:** https://microsoft.com/devicelogin
+1. **Open this URL in your browser:** ${verifyUrl}
 2. **Enter this code:** ${deviceCodeInfo.userCode}
 3. **Sign in with your Microsoft account that has OneNote access.**
 4. **After completing authentication, use the 'saveAccessToken' tool.**
@@ -1124,16 +1126,17 @@ async function main() {
       pendingAuth = { userCode: null, verificationUri: null, resolved: false };
       const credential = new DeviceCodeCredential({
         clientId: clientId,
+        tenantId: 'consumers',
         userPromptCallback: (info) => {
           pendingAuth.userCode = info.userCode;
-          pendingAuth.verificationUri = 'https://microsoft.com/devicelogin';
-          console.error(`Dashboard auth initiated — Code: ${info.userCode}`);
+          pendingAuth.verificationUri = info.verificationUri || 'https://microsoft.com/devicelogin';
+          console.error(`Dashboard auth initiated — Code: ${info.userCode}, URI: ${info.verificationUri}`);
         },
       });
 
       const tokenPromise = credential.getToken(scopes);
-      // Wait briefly for the callback to fire
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Wait for the callback to fire (device code request can take a few seconds)
+      await new Promise(resolve => setTimeout(resolve, 5000));
 
       if (!pendingAuth.userCode) {
         pendingAuth = null;
